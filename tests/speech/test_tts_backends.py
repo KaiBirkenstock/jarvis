@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from openjarvis.core.registry import TTSRegistry
 from openjarvis.speech.tts import TTSResult
@@ -57,6 +58,43 @@ def test_cartesia_synthesize():
     assert result.audio == b"fake-audio-mp3-bytes"
     assert result.format == "mp3"
     assert result.voice_id == "test-voice"
+
+
+# ---------------------------------------------------------------------------
+# Say backend tests
+# ---------------------------------------------------------------------------
+
+
+def test_say_registered():
+    from openjarvis.speech.say_tts import ensure_registered
+
+    ensure_registered()
+    assert TTSRegistry.contains("say")
+
+
+def test_say_synthesize(monkeypatch):
+    from openjarvis.speech.say_tts import SayTTSBackend
+
+    backend = SayTTSBackend()
+
+    monkeypatch.setattr(
+        "openjarvis.speech.say_tts.shutil.which",
+        lambda _name: "/usr/bin/say",
+    )
+
+    def fake_run(cmd, check, stdout, stderr):  # noqa: ANN001
+        audio_path = Path(cmd[cmd.index("-o") + 1])
+        audio_path.write_bytes(b"fake-say-audio")
+        return MagicMock(returncode=0)
+
+    monkeypatch.setattr("openjarvis.speech.say_tts.subprocess.run", fake_run)
+
+    result = backend.synthesize("Hello there", voice_id="Alex", speed=1.1)
+
+    assert result.audio == b"fake-say-audio"
+    assert result.format == "m4a"
+    assert result.voice_id == "Alex"
+    assert result.metadata["backend"] == "say"
 
 
 # ---------------------------------------------------------------------------

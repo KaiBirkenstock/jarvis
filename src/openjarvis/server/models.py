@@ -27,6 +27,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = 0.7
     max_tokens: int = 1024
     stream: bool = False
+    speak: bool = False
     tools: Optional[List[Dict[str, Any]]] = None
 
 

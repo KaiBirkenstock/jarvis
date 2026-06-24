@@ -3,6 +3,7 @@ import { Play, Pause, Volume2 } from 'lucide-react';
 
 interface AudioPlayerProps {
   src: string;
+  label?: string;
 }
 
 function formatTime(seconds: number): string {
@@ -11,7 +12,7 @@ function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-export function AudioPlayer({ src }: AudioPlayerProps) {
+export function AudioPlayer({ src, label = 'Assistant audio' }: AudioPlayerProps) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -48,6 +49,11 @@ export function AudioPlayer({ src }: AudioPlayerProps) {
       el.removeEventListener('ended', onEnded);
     };
   }, []);
+
+  useEffect(() => {
+    setPlaying(false);
+    setCurrentTime(0);
+  }, [src]);
 
   const progress = duration > 0 ? (currentTime / duration) * 100 : 0;
 
@@ -88,7 +94,7 @@ export function AudioPlayer({ src }: AudioPlayerProps) {
             className="text-xs font-medium"
             style={{ color: 'var(--color-text-secondary)' }}
           >
-            Morning Digest
+            {label}
           </span>
         </div>
 

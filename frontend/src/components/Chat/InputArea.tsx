@@ -16,6 +16,27 @@ import type {
   ToolCallInfo,
 } from '../../types';
 
+function cleanSpeakableText(text: string): string {
+  let cleaned = text.replace(/<think>[\s\S]*?<\/think>\s*/gi, '');
+  cleaned = cleaned.replace(/```[\s\S]*?```/g, ' ');
+  cleaned = cleaned.replace(/```/g, ' ');
+  cleaned = cleaned.replace(/^#{1,6}\s+/gm, '');
+  cleaned = cleaned.replace(/^\s*[-*•]\s+/gm, '');
+  cleaned = cleaned.replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1');
+  cleaned = cleaned.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+  cleaned = cleaned.replace(/`([^`]*)`/g, '$1');
+  cleaned = cleaned.replace(/[*_]{1,2}([^*_]+)[*_]{1,2}/g, '$1');
+  cleaned = cleaned.replace(/\s+/g, ' ').trim();
+  return cleaned;
+}
+
+function pickJarvisVoice(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
+  const preferred = voices.find((voice) => /en-GB/i.test(voice.lang) || /british|daniel|moira|serena|fiona|kate/i.test(voice.name));
+  if (preferred) return preferred;
+  const english = voices.find((voice) => /^en/i.test(voice.lang));
+  return english ?? voices[0] ?? null;
+}
+
 // While Deep Research is toggled on, poll connected sources for sync
 // progress so we can surface "Searching over N items — sync in progress"
 // next to the toggle. Polling is gated on `enabled` so toggling DR off
@@ -85,6 +106,7 @@ export function InputArea() {
   const streamState = useAppStore((s) => s.streamState);
   const messages = useAppStore((s) => s.messages);
   const speechEnabled = useAppStore((s) => s.settings.speechEnabled);
+  const wakeWordEnabled = useAppStore((s) => s.settings.wakeWordEnabled);
   const maxTokens = useAppStore((s) => s.settings.maxTokens);
   const temperature = useAppStore((s) => s.settings.temperature);
   const createConversation = useAppStore((s) => s.createConversation);
@@ -96,14 +118,24 @@ export function InputArea() {
   const deepResearch = useAppStore((s) => s.deepResearch);
   const setDeepResearch = useAppStore((s) => s.setDeepResearch);
   const corpusSync = useResearchCorpusSync(deepResearch);
+  const assistantAudioRef = useRef<HTMLAudioElement | null>(null);
+  const restartListeningRef = useRef<number | null>(null);
+  const sendMessageRef = useRef<(contentOverride?: string) => Promise<void>>(async () => {});
 
   const {
     state: speechState,
+    wakeWordState,
     error: speechError,
     available: speechAvailable,
+    wakeWordAvailable,
+    lastTranscript,
     startRecording,
+    startDictationListening,
     stopRecording,
+    startWakeWordListening,
+    stopWakeWordListening,
   } = useSpeech();
+  const [assistantSpeaking, setAssistantSpeaking] = useState(false);
 
   // Abort in-flight stream when the user switches models mid-generation.
   // This prevents errors from trying to continue a stream with a stale model.
@@ -134,20 +166,47 @@ export function InputArea() {
     }
   }, [speechError]);
 
-  const handleMicClick = useCallback(async () => {
-    if (speechState === 'recording') {
-      try {
-        const text = await stopRecording();
-        if (text) {
-          setInput((prev) => (prev ? prev + ' ' + text : text));
-        }
-      } catch {
-        // Error is captured in useSpeech
-      }
-    } else {
-      await startRecording();
+  useEffect(() => {
+    if (!speechEnabled || !wakeWordEnabled || !wakeWordAvailable || !speechAvailable) {
+      stopWakeWordListening();
+      return;
     }
-  }, [speechState, startRecording, stopRecording]);
+    if (streamState.isStreaming || speechState !== 'idle' || assistantSpeaking) {
+      stopWakeWordListening();
+      return;
+    }
+
+    let cancelled = false;
+    void startWakeWordListening(() => {
+      if (cancelled) return;
+      if (streamState.isStreaming || assistantSpeaking) return;
+      void startDictationListening({
+        onFinalTranscript: async (text) => {
+          const transcript = text.trim();
+          if (!transcript) return;
+          setInput(transcript);
+          await new Promise((resolve) => window.setTimeout(resolve, 300));
+          await sendMessageRef.current(transcript);
+        },
+      }).catch(() => {});
+    });
+
+    return () => {
+      cancelled = true;
+      stopWakeWordListening();
+    };
+  }, [
+    assistantSpeaking,
+    speechAvailable,
+    speechEnabled,
+    startDictationListening,
+    speechState,
+    startWakeWordListening,
+    stopWakeWordListening,
+    streamState.isStreaming,
+    wakeWordAvailable,
+    wakeWordEnabled,
+  ]);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -162,18 +221,95 @@ export function InputArea() {
       clearInterval(timerRef.current);
       timerRef.current = null;
     }
+    if (restartListeningRef.current) {
+      clearTimeout(restartListeningRef.current);
+      restartListeningRef.current = null;
+    }
+    if (assistantAudioRef.current) {
+      assistantAudioRef.current.pause();
+      assistantAudioRef.current = null;
+    }
+    setAssistantSpeaking(false);
+    stopWakeWordListening();
+    window.speechSynthesis?.cancel?.();
     resetStream();
-  }, [resetStream]);
+  }, [resetStream, stopWakeWordListening]);
 
-  const sendMessage = useCallback(async () => {
-    const content = input.trim();
+  const speakAssistantReply = useCallback(
+    async (rawText: string, audioUrl?: string): Promise<void> => {
+      if (typeof window === 'undefined') return;
+
+      if (audioUrl) {
+        const audio = new Audio(`${getBase()}${audioUrl}`);
+        assistantAudioRef.current = audio;
+        try {
+          let playFailed = false;
+          await new Promise<void>((resolve) => {
+            audio.onended = () => resolve();
+            audio.onerror = () => {
+              playFailed = true;
+              resolve();
+            };
+            void audio.play()
+              .catch(() => {
+                playFailed = true;
+                resolve();
+              });
+          });
+          if (!playFailed) {
+            return;
+          }
+        } finally {
+          if (assistantAudioRef.current === audio) {
+            assistantAudioRef.current = null;
+          }
+        }
+      }
+
+      const text = cleanSpeakableText(rawText);
+      if (!text || !('speechSynthesis' in window)) return;
+
+      const synth = window.speechSynthesis;
+      synth.cancel();
+      await new Promise<void>((resolve) => {
+        const utterance = new SpeechSynthesisUtterance(text);
+        const voices = synth.getVoices();
+        const voice = pickJarvisVoice(voices);
+        if (voice) {
+          utterance.voice = voice;
+          utterance.lang = voice.lang || 'en-GB';
+        } else {
+          utterance.lang = 'en-GB';
+        }
+        utterance.rate = 1;
+        utterance.pitch = 0.95;
+        utterance.onend = () => resolve();
+        utterance.onerror = () => resolve();
+        synth.speak(utterance);
+      });
+    },
+    [],
+  );
+
+  const sendMessage = useCallback(async (contentOverride?: string) => {
+    const content = (contentOverride ?? input).trim();
     if (!content || streamState.isStreaming) return;
     if (!selectedModel) {
       toast.error('Pick a model first (⌘K)');
+      if (contentOverride) setInput(content);
       return;
     }
 
     setInput('');
+    if (restartListeningRef.current) {
+      clearTimeout(restartListeningRef.current);
+      restartListeningRef.current = null;
+    }
+    window.speechSynthesis?.cancel?.();
+    if (assistantAudioRef.current) {
+      assistantAudioRef.current.pause();
+      assistantAudioRef.current = null;
+    }
 
     let convId = activeId;
     if (!convId) {
@@ -224,6 +360,7 @@ export function InputArea() {
       Array.from(researchSourcesByRef.values()).sort((a, b) => a.ref - b.ref);
     let lastFlush = 0;
     let ttftMs: number | undefined;
+    let audioMeta: { url: string } | undefined;
 
     setStreamState({
       isStreaming: true,
@@ -363,11 +500,18 @@ export function InputArea() {
           }
         }
       } else {
-      for await (const sseEvent of streamChat(
-        { model: selectedModel, messages: apiMessages, stream: true, temperature, max_tokens: maxTokens },
-        controller.signal,
-      )) {
-        const eventName = sseEvent.event;
+        for await (const sseEvent of streamChat(
+          {
+            model: selectedModel,
+            messages: apiMessages,
+            stream: true,
+            temperature,
+            max_tokens: maxTokens,
+            speak: speechEnabled,
+          },
+          controller.signal,
+        )) {
+          const eventName = sseEvent.event;
 
         if (eventName === 'agent_turn_start') {
           setStreamState({ phase: 'Agent thinking...' });
@@ -413,6 +557,15 @@ export function InputArea() {
               activeToolCalls: [...toolCalls],
             });
             updateLastAssistant(convId, accumulatedContent, [...toolCalls]);
+          } catch {}
+        } else if (eventName === 'audio') {
+          try {
+            const data = JSON.parse(sseEvent.data);
+            if (data?.audio?.url) {
+              audioMeta = { url: data.audio.url };
+            } else if (data?.url) {
+              audioMeta = { url: data.url };
+            }
           } catch {}
         } else {
           try {
@@ -475,19 +628,6 @@ export function InputArea() {
         complexity_tier: complexity?.tier,
         suggested_max_tokens: complexity?.suggested_max_tokens,
       };
-      // Check if the response has digest audio available
-      let audioMeta: { url: string } | undefined;
-      try {
-        const digestRes = await fetch(`${getBase()}/api/digest`);
-        if (digestRes.ok) {
-          const digest = await digestRes.json();
-          if (digest.audio_available) {
-            audioMeta = { url: `${getBase()}/api/digest/audio` };
-          }
-        }
-      } catch {
-        // Not a digest response or server unavailable — skip
-      }
 
       updateLastAssistant(
         convId,
@@ -499,6 +639,24 @@ export function InputArea() {
         researchTraces.length > 0 ? researchTraces : undefined,
         researchSourcesByRef.size > 0 ? flushSources() : undefined,
       );
+      if (speechEnabled && accumulatedContent) {
+        try {
+          setAssistantSpeaking(true);
+          await speakAssistantReply(accumulatedContent, audioMeta?.url);
+        } catch {
+          // Voice output is best-effort; the audio bubble is still available.
+        } finally {
+          setAssistantSpeaking(false);
+        }
+      } else {
+        setAssistantSpeaking(false);
+      }
+      if (speechEnabled && accumulatedContent && (!wakeWordEnabled || !wakeWordAvailable) && speechAvailable) {
+        restartListeningRef.current = window.setTimeout(() => {
+          restartListeningRef.current = null;
+          void startRecording().catch(() => {});
+        }, 150);
+      }
       if (timerRef.current) {
         clearInterval(timerRef.current);
         timerRef.current = null;
@@ -531,9 +689,35 @@ export function InputArea() {
     setStreamState,
     resetStream,
     deepResearch,
+    speechAvailable,
+    speechEnabled,
+    wakeWordAvailable,
+    wakeWordEnabled,
+    startRecording,
+    speakAssistantReply,
+    stopWakeWordListening,
     temperature,
     maxTokens,
   ]);
+
+  const handleMicClick = useCallback(async () => {
+    if (speechState === 'recording') {
+      try {
+        const text = await stopRecording();
+        if (text) {
+          await sendMessage(text);
+        }
+      } catch {
+        // Error is captured in useSpeech
+      }
+    } else {
+      await startRecording();
+    }
+  }, [speechState, startRecording, stopRecording, sendMessage]);
+
+  useEffect(() => {
+    sendMessageRef.current = sendMessage;
+  }, [sendMessage]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -613,7 +797,9 @@ export function InputArea() {
               reason={micReason}
             />
             <button
-              onClick={sendMessage}
+              onClick={() => {
+                void sendMessage();
+              }}
               disabled={!input.trim() || modelLoading || !selectedModel}
               title={selectedModel ? 'Send message' : 'Pick a model first (⌘K)'}
               className="p-2 rounded-xl transition-colors shrink-0 cursor-pointer disabled:opacity-30 disabled:cursor-default"
@@ -633,6 +819,27 @@ export function InputArea() {
           <kbd className="font-mono">Shift+Enter</kbd> for new line
         </span>
       </div>
+      {lastTranscript && (
+        <div
+          className="mt-2 text-center text-[11px] px-3"
+          style={{ color: 'var(--color-text-secondary)' }}
+        >
+          Heard: <span style={{ color: 'var(--color-text)' }}>&ldquo;{lastTranscript}&rdquo;</span>
+        </div>
+      )}
+      {speechEnabled && wakeWordEnabled && (
+        <div className="mt-1 text-center text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+          {speechAvailable && wakeWordAvailable ? (
+            wakeWordState === 'listening'
+              ? 'Wake word active: say "Jarvis" to start talking'
+              : 'Wake word will resume after the assistant finishes speaking'
+          ) : (
+            speechAvailable
+              ? 'Wake word is not supported in this browser'
+              : 'Voice backend is not available'
+          )}
+        </div>
+      )}
     </div>
   );
 }

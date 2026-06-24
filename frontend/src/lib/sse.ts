@@ -7,6 +7,7 @@ export interface ChatRequest {
   stream: true;
   temperature?: number;
   max_tokens?: number;
+  speak?: boolean;
 }
 
 export async function* streamChat(
@@ -106,4 +107,3 @@ export async function* streamResearch(
     reader.releaseLock();
   }
 }
-

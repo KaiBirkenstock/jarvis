@@ -27,13 +27,22 @@ CLEANUP_PIDS=()
 cleanup() {
   echo ""
   info "Shutting down..."
-  for pid in "${CLEANUP_PIDS[@]}"; do
-    kill "$pid" 2>/dev/null || true
-  done
+  if [ "${#CLEANUP_PIDS[@]}" -gt 0 ]; then
+    for pid in "${CLEANUP_PIDS[@]}"; do
+      kill "$pid" 2>/dev/null || true
+    done
+  fi
   wait 2>/dev/null || true
   ok "Done."
 }
 trap cleanup EXIT INT TERM
+
+# Keep tool caches in writable locations inside the sandbox / local machine.
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/private/tmp/openjarvis-uv-cache}"
+export npm_config_cache="${npm_config_cache:-/private/tmp/openjarvis-npm-cache}"
+export CARGO_HOME="${CARGO_HOME:-/private/tmp/openjarvis-cargo}"
+export OPENJARVIS_HOME="${OPENJARVIS_HOME:-/private/tmp/openjarvis-home}"
+export HF_HOME="${HF_HOME:-/private/tmp/openjarvis-hf}"
 
 # ── Navigate to repo root ────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -185,7 +194,7 @@ ok "Frontend running at http://localhost:5173"
 URL="http://localhost:5173"
 info "Opening $URL ..."
 case "$(uname -s)" in
-  Darwin) open "$URL" ;;
+  Darwin) open "$URL" 2>/dev/null || true ;;
   Linux)  xdg-open "$URL" 2>/dev/null || true ;;
   MINGW*|MSYS*|CYGWIN*) cmd /c start "" "$URL" 2>/dev/null || true ;;
   *)      true ;;

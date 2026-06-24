@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -11,6 +11,7 @@ fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from openjarvis.server.app import create_app  # noqa: E402
+from openjarvis.server.models import AudioMeta  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -438,6 +439,41 @@ class TestChatCompletions:
                 if delta_content:
                     content += delta_content
         assert content == "Hello world"
+
+    def test_non_streaming_speak_attaches_audio(self, client):
+        with patch(
+            "openjarvis.server.routes._synthesize_chat_audio",
+            return_value=AudioMeta(url="/api/chat/audio/test.m4a"),
+        ):
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "speak": True,
+                },
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["choices"][0]["message"]["audio"]["url"] == "/api/chat/audio/test.m4a"
+
+    def test_streaming_speak_emits_audio_event(self, client):
+        with patch(
+            "openjarvis.server.routes._synthesize_chat_audio",
+            return_value=AudioMeta(url="/api/chat/audio/test.m4a"),
+        ):
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": True,
+                    "speak": True,
+                },
+            )
+        assert resp.status_code == 200
+        assert "event: audio" in resp.text
+        assert "/api/chat/audio/test.m4a" in resp.text
 
     def test_streaming_with_tools_emits_tool_calls_and_bypasses_agent(self):
         """Regression for the streaming analog of #414.

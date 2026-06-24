@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from openjarvis.core.paths import get_config_dir
 from openjarvis.core.types import Message, Role
 from openjarvis.server.models import (
+    AudioMeta,
     ChatCompletionChunk,
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -87,6 +90,108 @@ def _ensure_identity_prompt(messages: list[Message], app_config) -> list[Message
         return messages
 
     return [Message(role=Role.SYSTEM, content=prompt), *messages]
+
+
+def _ensure_local_tts_backend() -> None:
+    """Make sure the local TTS backend is registered after registry resets."""
+    import openjarvis.speech  # noqa: F401
+
+    try:
+        from openjarvis.speech.say_tts import ensure_registered
+
+        ensure_registered()
+    except Exception:
+        logging.getLogger("openjarvis.server").debug(
+            "Local TTS backend registration skipped",
+            exc_info=True,
+        )
+
+
+def _chat_audio_dir() -> Path:
+    """Directory used for generated chat audio files."""
+    return get_config_dir() / "chat_audio"
+
+
+def _chat_audio_path(audio_name: str) -> Path:
+    """Resolve a chat audio filename safely within the cache directory."""
+    audio_root = _chat_audio_dir().resolve()
+    path = (audio_root / audio_name).resolve()
+    if not path.is_relative_to(audio_root):
+        raise HTTPException(status_code=404, detail="Audio not found")
+    return path
+
+
+def _clean_tts_text(text: str) -> str:
+    """Make assistant output more natural for speech synthesis."""
+    cleaned = re.sub(r"<think>[\s\S]*?</think>\s*", "", text, flags=re.IGNORECASE)
+    cleaned = cleaned.replace("```", "")
+    cleaned = re.sub(r"^#{1,6}\s+", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"^\s*[-*•]\s+", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", cleaned)
+    cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
+    cleaned = re.sub(r"`([^`]*)`", r"\1", cleaned)
+    cleaned = re.sub(r"[*_]{1,2}([^*_]+)[*_]{1,2}", r"\1", cleaned)
+    return cleaned.strip()
+
+
+def _synthesize_chat_audio(
+    text: str,
+    *,
+    voice_id: str = "",
+    speed: float = 1.0,
+) -> AudioMeta | None:
+    """Best-effort local TTS synthesis for assistant replies."""
+    text = _clean_tts_text(text)
+    if not text:
+        return None
+
+    _ensure_local_tts_backend()
+
+    from openjarvis.core.registry import TTSRegistry
+
+    backend_key = ""
+    if TTSRegistry.contains("say"):
+        try:
+            if TTSRegistry.get("say")().health():
+                backend_key = "say"
+        except Exception:
+            backend_key = ""
+    if not backend_key and TTSRegistry.contains("kokoro"):
+        backend_key = "kokoro"
+    if not backend_key or not TTSRegistry.contains(backend_key):
+        return None
+
+    try:
+        backend_cls = TTSRegistry.get(backend_key)
+        backend = backend_cls()
+        output_format = "m4a" if backend_key == "say" else "wav"
+        result = backend.synthesize(
+            text,
+            voice_id=voice_id,
+            speed=speed,
+            output_format=output_format,
+        )
+    except Exception:
+        logging.getLogger("openjarvis.server").debug(
+            "Chat TTS synthesis failed",
+            exc_info=True,
+        )
+        return None
+
+    audio_dir = _chat_audio_dir()
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    ext = (result.format or output_format).lstrip(".")
+    audio_name = f"chat-{uuid.uuid4().hex}.{ext}"
+    audio_path = audio_dir / audio_name
+    try:
+        result.save(audio_path)
+    except Exception:
+        logging.getLogger("openjarvis.server").debug(
+            "Saving chat TTS audio failed",
+            exc_info=True,
+        )
+        return None
+    return AudioMeta(url=f"/api/chat/audio/{audio_name}")
 
 
 @router.post("/v1/chat/completions")
@@ -251,6 +356,15 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     return response
 
 
+@router.get("/api/chat/audio/{audio_name}")
+async def get_chat_audio(audio_name: str):
+    """Serve a generated chat audio file."""
+    audio_path = _chat_audio_path(audio_name)
+    if not audio_path.exists():
+        raise HTTPException(status_code=404, detail="Audio not found")
+    return FileResponse(str(audio_path), filename=audio_path.name)
+
+
 def _remember_exchange(memory_service, user_text: str, response) -> None:
     """Submit a completed exchange to the memory service (non-blocking)."""
     if memory_service is None or not user_text:
@@ -339,6 +453,8 @@ def _handle_direct(
     usage = result.get("usage", {})
 
     choice_msg = ChoiceMessage(role="assistant", content=content)
+    if req.speak:
+        choice_msg.audio = _synthesize_chat_audio(content)
     # Include tool calls if present
     tool_calls = result.get("tool_calls")
     if tool_calls:
@@ -432,6 +548,8 @@ def _handle_agent(
 
         if Path(audio_path).exists():
             audio_meta = AudioMeta(url="/api/digest/audio")
+    if req.speak and audio_meta is None:
+        audio_meta = _synthesize_chat_audio(result.content)
 
     return ChatCompletionResponse(
         model=model,
@@ -480,6 +598,7 @@ async def _handle_stream_tools(
 
     async def generate():
         # Send the role chunk first (OpenAI convention).
+        full_content = ""
         first_chunk = ChatCompletionChunk(
             id=chunk_id,
             model=model,
@@ -497,6 +616,7 @@ async def _handle_stream_tools(
                 tools=req.tools,
             ):
                 if sc.content:
+                    full_content += sc.content
                     content_chunk = ChatCompletionChunk(
                         id=chunk_id,
                         model=model,
@@ -537,6 +657,20 @@ async def _handle_stream_tools(
             yield f"data: {error_chunk.model_dump_json()}\n\n"
             yield "data: [DONE]\n\n"
             return
+
+        audio_meta = _synthesize_chat_audio(full_content) if req.speak else None
+        if audio_meta is not None:
+            import json as _json
+            import time as _time
+
+            audio_chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(_time.time()),
+                "model": model,
+                "audio": audio_meta.model_dump(),
+            }
+            yield f"event: audio\ndata: {_json.dumps(audio_chunk)}\n\n"
 
         import json as _json
 
@@ -709,6 +843,19 @@ async def _handle_stream(
                 started_at=started_at,
                 ended_at=time.time(),
             )
+
+        audio_meta = _synthesize_chat_audio(full_content) if req.speak else None
+        if audio_meta is not None:
+            import json as _json
+
+            audio_chunk = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "audio": audio_meta.model_dump(),
+            }
+            yield f"event: audio\ndata: {_json.dumps(audio_chunk)}\n\n"
 
         # Send finish chunk with usage data if available
         import json as _json
